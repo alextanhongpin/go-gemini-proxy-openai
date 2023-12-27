@@ -1,8 +1,9 @@
 module github.com/alextanhongpin/go-gemini
 
-go 1.21.5
+go 1.21
 
 require (
+	github.com/alextanhongpin/core v0.0.0-20231129151859-25108d35c6fa
 	github.com/google/generative-ai-go v0.5.0
 	github.com/sashabaranov/go-openai v1.17.9
 	google.golang.org/api v0.154.0
