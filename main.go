@@ -25,21 +25,28 @@ import (
 
 type contextKey string
 
-var apiKeyContextKey contextKey = "api_key"
-
 const systemPrompt = "I will ask you a question. Please answer it."
 
+// Gemini roles.
 const (
 	roleUser  = "user"
 	roleModel = "model"
 )
 
+// Errors.
 var ErrInvalidParams = errors.New("invalid parameters")
 
-var logger *slog.Logger
+var (
 
-// Store all the clients per api key.
-var clients sync.Map
+	// Global logger.
+	logger *slog.Logger
+
+	// Store all the clients per api key.
+	clients sync.Map
+
+	// ApiKey context key.
+	apiKeyContextKey contextKey = "api_key"
+)
 
 type openaiAdapter interface {
 	ChatCompletion(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error)
@@ -50,9 +57,9 @@ func init() {
 	logger = slog.New(slog.NewTextHandler(os.Stdout, nil))
 }
 
-// TODO: Cleanup the implementation.
 func main() {
 	defer func() {
+		// Terminate all clients before exiting.
 		clients.Range(func(key, val any) bool {
 			_ = val.(*genai.Client).Close()
 
@@ -90,7 +97,7 @@ var finishReasons = map[genai.FinishReason]openai.FinishReason{
 	genai.FinishReasonOther:       openai.FinishReasonNull,
 }
 
-var toGeminiRole = map[string]string{
+var geminiRolesByOpenAIRoles = map[string]string{
 	"system":    roleUser,
 	"assistant": roleModel,
 	"user":      roleUser,
@@ -104,7 +111,7 @@ func (h openaiHandler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	// Let the client handle authorization error.
-	apiKey := strings.ReplaceAll(r.Header.Get("Authorization"), "Bearer ", "")
+	apiKey := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	ctx = context.WithValue(ctx, apiKeyContextKey, apiKey)
 
 	b, err := io.ReadAll(r.Body)
@@ -170,7 +177,46 @@ func (h openaiHandler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (g *gemini) clientFromContext(ctx context.Context) (*genai.Client, error) {
+type gemini struct {
+	openaiAdapter
+}
+
+func (g *gemini) ChatCompletion(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
+	msgs, err := mergeOpenAIMessages(req.Messages)
+	if err != nil {
+		return nil, err
+	}
+
+	contents, err := openaiToGenaiContents(msgs)
+	if err != nil {
+		return nil, err
+	}
+
+	model, err := g.loadOrStoreModel(ctx, req, isMultiModal(contents))
+	if err != nil {
+		return nil, err
+	}
+
+	// Chat messages must have roles alternating between 'user' and 'model'.
+	sc := model.StartChat()
+
+	// The first message must be from role `user`
+	contents = fixContentRoleOrder(contents)
+
+	var last *genai.Content
+	last, contents = contents[len(contents)-1], contents[:len(contents)-1]
+	sc.History = contents
+
+	// The send message must be from role `user`.
+	resp, err := sc.SendMessage(ctx, last.Parts...)
+	if err != nil {
+		return nil, err
+	}
+
+	return genaiToOpenaiResponse(resp)
+}
+
+func (g *gemini) createClient(ctx context.Context) (*genai.Client, error) {
 	apiKey := ctx.Value(apiKeyContextKey).(string)
 	client, ok := clients.Load(apiKey)
 	if !ok {
@@ -190,124 +236,86 @@ func (g *gemini) clientFromContext(ctx context.Context) (*genai.Client, error) {
 	return client.(*genai.Client), nil
 }
 
-type gemini struct {
-	openaiAdapter
-}
+// mergeOpenAIMessages merge the messages with the same role. This ensures that there
+// are no consecutive messages with the same role.
+// For example, if the messages are:
+// [
+//
+//	{role: "user", content: "hello"},
+//	{role: "user", content: "world"},
+//	{role: "assistant", content: "hi"},
+//	{role: "assistant", content: "there"},
+//
+// ]
+// The result will be:
+// [
+//
+//	{role: "user", content: "hello\nworld"},
+//	{role: "assistant", content: "hi\nthere"},
+//
+// ]
+func mergeOpenAIMessages(msgs []openai.ChatCompletionMessage) ([]openai.ChatCompletionMessage, error) {
+	var prevRole string
+	var res []openai.ChatCompletionMessage
 
-func (g *gemini) ChatCompletion(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error) {
-	var lastRole string
-	var msgs []openai.ChatCompletionMessage
-	for _, msg := range req.Messages {
-		role, ok := toGeminiRole[msg.Role]
+	for _, msg := range msgs {
+		role, ok := geminiRolesByOpenAIRoles[msg.Role]
 		if !ok {
 			return nil, fmt.Errorf("%w: failed to map openai role to gemini role: role=%q", ErrInvalidParams, msg.Role)
 		}
 
-		if role == lastRole {
+		if role == prevRole {
 			// Merge the content if the roles are similar.
-			lastMsg := msgs[len(msgs)-1]
+			prevMsg := res[len(res)-1]
 
-			lhsMulti := len(lastMsg.MultiContent) > 0
-			rhsMulti := len(msg.MultiContent) > 0
-			multi := lhsMulti || rhsMulti
-			if multi {
-				if lhsMulti && rhsMulti {
-					lastMsg.MultiContent = append(lastMsg.MultiContent, msg.MultiContent...)
-				} else if lhsMulti && !rhsMulti {
-					lastMsg.MultiContent = append(lastMsg.MultiContent, openai.ChatMessagePart{
+			lmc := prevMsg.MultiContent
+			lc := prevMsg.Content
+			rmc := msg.MultiContent
+			rc := msg.Content
+
+			lok := len(lmc) > 0
+			rok := len(rmc) > 0
+
+			switch {
+			case lok && rok:
+				lmc = append(lmc, rmc...)
+			case lok && !rok:
+				lmc = append(lmc, openai.ChatMessagePart{
+					Type: openai.ChatMessagePartTypeText,
+					Text: rc,
+				})
+			case !lok && rok:
+				lmc = append([]openai.ChatMessagePart{
+					{
 						Type: openai.ChatMessagePartTypeText,
-						Text: msg.Content,
-					})
-					lastMsg.Content = ""
-				} else if !lhsMulti && rhsMulti {
-					lastMsg.MultiContent = append([]openai.ChatMessagePart{
-						{
-							Type: openai.ChatMessagePartTypeText,
-							Text: lastMsg.Content,
-						},
-					}, msg.MultiContent...)
-					lastMsg.Content = ""
-				}
-			} else {
-				lastMsg.Content += " " + msg.Content
+						Text: lc,
+					},
+				}, rmc...)
+				lc = ""
+			case !lok && !rok:
+				lc = strings.Join([]string{lc, rc}, "\n")
 			}
-			msgs[len(msgs)-1] = lastMsg
+
+			prevMsg.MultiContent = lmc
+			prevMsg.Content = lc
+			res[len(res)-1] = prevMsg
 		} else {
-			lastRole = role
-			msgs = append(msgs, msg)
+			prevRole = role
+			res = append(res, msg)
 		}
 	}
 
-	var multimodal bool
-	contents := make([]*genai.Content, len(msgs))
-	for i, msg := range msgs {
-		role := msg.Role
-
-		var parts []genai.Part
-		if len(msg.MultiContent) > 0 {
-			parts = make([]genai.Part, len(msg.MultiContent))
-			for j, content := range msg.MultiContent {
-				switch content.Type {
-				case openai.ChatMessagePartTypeText:
-					parts[j] = genai.Text(content.Text)
-				case openai.ChatMessagePartTypeImageURL:
-					mimeType, imgBlob, err := decodeBase64Image(content.ImageURL.URL)
-					if err != nil {
-						return nil, err
-					}
-					mimeType = strings.ReplaceAll(mimeType, "image/", "")
-					logger.Info("image", slog.String("mime_type", mimeType), slog.Int("size", len(imgBlob)))
-					parts[j] = genai.ImageData(mimeType, imgBlob)
-					multimodal = true
-				}
-			}
-		} else {
-			parts = append(parts, genai.Text(msg.Content))
-		}
-
-		contents[i] = &genai.Content{
-			Role:  toGeminiRole[role],
-			Parts: parts,
-		}
-	}
-
-	model, err := g.llm(ctx, req, multimodal)
-	if err != nil {
-		return nil, err
-	}
-
-	// Chat messages must have roles alternating between 'user' and 'model'.
-	sc := model.StartChat()
-
-	// The first message must be from role `user`
-	if contents[0].Role != roleUser {
-		contents = append([]*genai.Content{{
-			Role:  roleUser,
-			Parts: []genai.Part{genai.Text(systemPrompt)},
-		}}, contents...)
-	}
-
-	var last *genai.Content
-	last, contents = contents[len(contents)-1], contents[:len(contents)-1]
-	sc.History = contents
-
-	// The send message must be from role `user`.
-	resp, err := sc.SendMessage(ctx, last.Parts...)
-	if err != nil {
-		return nil, err
-	}
-
-	return g.toGeminiResponse(resp)
+	return res, nil
 }
 
-func (g *gemini) llm(ctx context.Context, req openai.ChatCompletionRequest, multimodal bool) (*genai.GenerativeModel, error) {
-	client, err := g.clientFromContext(ctx)
+func (g *gemini) loadOrStoreModel(ctx context.Context, req openai.ChatCompletionRequest, isMultiModal bool) (*genai.GenerativeModel, error) {
+	client, err := g.createClient(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	var model *genai.GenerativeModel
-	if multimodal {
+	if isMultiModal {
 		model = client.GenerativeModel("gemini-pro-vision")
 	} else {
 		model = client.GenerativeModel("gemini-pro")
@@ -343,13 +351,26 @@ func (g *gemini) llm(ctx context.Context, req openai.ChatCompletionRequest, mult
 		slog.String("stop_sequences", strings.Join(stopSequences, " ")),
 		slog.Float64("temperature", float64(temperature)),
 		slog.Float64("top_p", float64(topP)),
-		slog.Bool("multimodal", multimodal),
+		slog.Bool("isMultiModal", isMultiModal),
 	)
 
 	return model, nil
 }
 
-func (g *gemini) toGeminiResponse(resp *genai.GenerateContentResponse) (*openai.ChatCompletionResponse, error) {
+func isMultiModal(contents []*genai.Content) bool {
+	for _, c := range contents {
+		for _, p := range c.Parts {
+			_, ok := p.(genai.Blob)
+			if ok {
+				return ok
+			}
+		}
+	}
+
+	return false
+}
+
+func genaiToOpenaiResponse(resp *genai.GenerateContentResponse) (*openai.ChatCompletionResponse, error) {
 	var res openai.ChatCompletionResponse
 	res.Choices = make([]openai.ChatCompletionChoice, len(resp.Candidates))
 
@@ -409,32 +430,6 @@ func mergeText(in []genai.Part) string {
 	return strings.Join(texts, "")
 }
 
-func mergeTexts(in []genai.Part) []genai.Part {
-	var out []genai.Part
-	i := 0
-	for i < len(in) {
-		if t, ok := in[i].(genai.Text); ok {
-			texts := []string{string(t)}
-			var j int
-			for j = i + 1; j < len(in); j++ {
-				if t, ok := in[j].(genai.Text); ok {
-					texts = append(texts, string(t))
-				} else {
-					break
-				}
-			}
-			// j is just after the last Text.
-			out = append(out, genai.Text(strings.Join(texts, "")))
-			i = j
-		} else {
-			out = append(out, in[i])
-			i++
-		}
-	}
-
-	return out
-}
-
 // WriteIfNotExists writes the file to
 // the designated location, only if it
 // does not exists.
@@ -471,4 +466,72 @@ func decodeBase64Image(b64 string) (mimeType string, blob []byte, err error) {
 
 	blob, err = base64.StdEncoding.DecodeString(b64Image)
 	return
+}
+
+func openaiToGenaiContent(msg openai.ChatCompletionMessage) (*genai.Content, error) {
+	r := msg.Role
+	c := msg.Content
+	mc := msg.MultiContent
+
+	var parts []genai.Part
+	if len(mc) > 0 {
+		parts = make([]genai.Part, len(mc))
+
+		for j, content := range mc {
+			ctype := content.Type
+			ctext := content.Text
+
+			switch ctype {
+			case openai.ChatMessagePartTypeText:
+				parts[j] = genai.Text(ctext)
+
+			case openai.ChatMessagePartTypeImageURL:
+				b64img := content.ImageURL.URL
+
+				mimeType, blob, err := decodeBase64Image(b64img)
+				if err != nil {
+					return nil, err
+				}
+
+				format := strings.TrimPrefix(mimeType, "image/")
+				parts[j] = genai.ImageData(format, blob)
+			}
+		}
+	} else {
+		parts = append(parts, genai.Text(c))
+	}
+
+	return &genai.Content{
+		Role:  geminiRolesByOpenAIRoles[r],
+		Parts: parts,
+	}, nil
+}
+
+func openaiToGenaiContents(msgs []openai.ChatCompletionMessage) ([]*genai.Content, error) {
+	contents := make([]*genai.Content, len(msgs))
+
+	for i, msg := range msgs {
+		content, err := openaiToGenaiContent(msg)
+		if err != nil {
+			return nil, err
+		}
+		contents[i] = content
+	}
+
+	return contents, nil
+}
+
+func fixContentRoleOrder(contents []*genai.Content) []*genai.Content {
+	if contents[len(contents)-1].Role != roleUser {
+		panic("last message must be from user")
+	}
+
+	if contents[0].Role == roleUser {
+		return contents
+	}
+
+	return append([]*genai.Content{{
+		Role:  roleUser,
+		Parts: []genai.Part{genai.Text(systemPrompt)},
+	}}, contents...)
 }
