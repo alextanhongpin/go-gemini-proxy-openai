@@ -6,11 +6,14 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"time"
 
 	"log/slog"
 
 	"github.com/google/generative-ai-go/genai"
+	"github.com/google/uuid"
 	openai "github.com/sashabaranov/go-openai"
+	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 )
 
@@ -27,6 +30,7 @@ func AuthContext(ctx context.Context, apiKey string) context.Context {
 
 type openaiClient interface {
 	ChatCompletion(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error)
+	ChatCompletionStream(ctx context.Context, req openai.ChatCompletionRequest) (chan openai.ChatCompletionStreamResponse, error)
 }
 
 type Adapter struct {
@@ -34,6 +38,8 @@ type Adapter struct {
 	clients sync.Map
 	logger  *slog.Logger
 }
+
+var _ openaiClient = (*Adapter)(nil)
 
 func NewAdapter() *Adapter {
 	return &Adapter{}
@@ -78,6 +84,49 @@ func (a *Adapter) ChatCompletion(ctx context.Context, req openai.ChatCompletionR
 	}
 
 	return toOpenaiResponse(resp)
+}
+
+func (a *Adapter) ChatCompletionStream(ctx context.Context, req openai.ChatCompletionRequest) (chan openai.ChatCompletionStreamResponse, error) {
+	contents := buildContent(req.Messages)
+	model, err := a.loadOrStoreModel(ctx, req, isMultiModal(contents))
+	if err != nil {
+		return nil, err
+	}
+
+	contents, tail := pop(contents)
+
+	// Chat messages must have roles alternating between 'user' and 'model'.
+	sc := model.StartChat()
+	sc.History = contents
+	if a.logger != nil {
+		a.logger.Info("sendMessage",
+			slog.Any("contents", contents),
+			slog.Any("tail", tail),
+		)
+	}
+
+	ch := make(chan openai.ChatCompletionStreamResponse)
+	go func() {
+		iter := sc.SendMessageStream(ctx, tail.Parts...)
+
+		for {
+			res, err := iter.Next()
+			if err == iterator.Done {
+				close(ch)
+				break
+			}
+
+			ch <- openai.ChatCompletionStreamResponse{
+				ID:      "cmpl-" + uuid.New().String(),
+				Object:  "chat.completion.chunk",
+				Created: time.Now().Unix(),
+				Model:   req.Model,
+				Choices: toOpenaiStreamChoices(res.Candidates),
+			}
+		}
+	}()
+
+	return ch, nil
 }
 
 func (a *Adapter) createClient(ctx context.Context) (*genai.Client, error) {
