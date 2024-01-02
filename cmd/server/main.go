@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -14,6 +15,7 @@ import (
 
 type openaiClient interface {
 	ChatCompletion(ctx context.Context, req openai.ChatCompletionRequest) (*openai.ChatCompletionResponse, error)
+	ChatCompletionStream(ctx context.Context, req openai.ChatCompletionRequest) (chan openai.ChatCompletionStreamResponse, error)
 }
 
 var logger *slog.Logger
@@ -65,6 +67,11 @@ func (h openaiHandler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.Stream {
+		h.streamResponse(ctx, w, req)
+		return
+	}
+
 	res, err := h.adapter.ChatCompletion(ctx, req)
 	if err != nil {
 		logger.Error("chat completion failed",
@@ -81,4 +88,31 @@ func (h openaiHandler) ChatCompletion(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+}
+
+func (h openaiHandler) streamResponse(ctx context.Context, w http.ResponseWriter, req openai.ChatCompletionRequest) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Content-Type", "text/event-stream")
+
+	ch, err := h.adapter.ChatCompletionStream(ctx, req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusPreconditionFailed)
+		return
+	}
+
+	for res := range ch {
+		b, err := json.Marshal(res)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		fmt.Fprintf(w, "data: %s \n\n", b)
+		w.(http.Flusher).Flush()
+	}
+
+	fmt.Fprint(w, "data: [DONE] \n\n")
+	w.(http.Flusher).Flush()
 }

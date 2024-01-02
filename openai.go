@@ -136,3 +136,30 @@ func toOpenaiChoice(c *genai.Candidate) openai.ChatCompletionChoice {
 		FinishReason: finishReason,
 	}
 }
+
+func toOpenaiStreamChoices(candidates []*genai.Candidate) []openai.ChatCompletionStreamChoice {
+	choices := make([]openai.ChatCompletionStreamChoice, len(candidates))
+	for i, c := range candidates {
+		choices[i] = toOpenaiStreamChoice(c)
+	}
+
+	return choices
+}
+
+func toOpenaiStreamChoice(c *genai.Candidate) openai.ChatCompletionStreamChoice {
+	index := int(c.Index)
+	content := mergeText(c.Content.Parts)
+	role := toOpenaiRole[c.Content.Role]
+	finishReason := toOpenaiFinishReason[c.FinishReason]
+
+	return openai.ChatCompletionStreamChoice{
+		Index: index,
+		Delta: openai.ChatCompletionStreamChoiceDelta{
+			Content: content,
+			Role:    role,
+		},
+		FinishReason: finishReason,
+		// TODO: Complete the rest of the fields.
+		// ContentFilterResults : ContentFilterResults
+	}
+}
